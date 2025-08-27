@@ -1,0 +1,377 @@
+---
+# ==========================================================
+# Nextcloud GmbH
+# Talk HPB Recording Server Automated Install
+# Written by João Cortez - joao.cortez@nextcloud.com
+# ==========================================================
+# This playbook will:
+# - Prompt for email, record server URL, cloud URL, talk_secret, talk_internal_secret
+# - Install required system packages, geckodriver, and dependencies
+# - Create service user and directories
+# - Remove old repo folder before cloning fresh
+# - Clone and install Recording Server into Python venv
+# - Configure server.conf with provided secrets
+# - Setup systemd service for Recording Server
+# - Configure Nginx reverse proxy + Let's Encrypt
+# - Enable and start service
+# ==========================================================
+- name: Provision Nextcloud Talk HPB Recording Server
+  hosts: localhost
+  connection: local
+  become: true
+  gather_facts: true
+  vars_prompt:
+    - name: __banner_ack
+      prompt: |
+        =========================================================
+        Nextcloud GmbH
+        Talk HPB Recording Server Automated Install
+        =========================================================
+        Press ENTER to continue...
+      private: no
+    - name: admin_email
+      prompt: "Your admin email (for Let's Encrypt)"
+      private: no
+    - name: record_url
+      prompt: "Recording Server URL (e.g. record.yourdomain.com)"
+      private: no
+    - name: cloud_url
+      prompt: "Cloud URL (e.g. cloud.yourdomain.com)"
+      private: no
+    - name: talk_secret
+      prompt: "Talk Secret"
+      private: no
+    - name: talk_internal_secret
+      prompt: "Talk Internal Secret"
+      private: no
+
+  pre_tasks:
+    - name: Validate required inputs
+      ansible.builtin.assert:
+        that:
+          - admin_email is match('^[^@]+@[^@]+\.[^@]+$')
+          - record_url is match('^[a-zA-Z0-9.-]+$')
+          - cloud_url is match('^[a-zA-Z0-9.-]+$')
+          - talk_secret != ""
+          - talk_internal_secret != ""
+        fail_msg: "Invalid input detected. Please check all prompts."
+
+  tasks:
+    - name: Update apt cache and upgrade packages
+      ansible.builtin.apt:
+        update_cache: yes
+        upgrade: dist
+        cache_valid_time: 3600
+
+    - name: Install system packages
+      ansible.builtin.apt:
+        name:
+          - git
+          - python3
+          - python3-venv
+          - python3-pip
+          - ffmpeg
+          - pulseaudio
+          - xvfb
+          - x11-utils
+          - xdotool
+          - fonts-liberation
+          - wget
+          - apt-transport-https
+          - gnupg
+          - nginx
+          - certbot
+          - python3-certbot-nginx
+        state: present
+
+    - name: Add Mozilla APT key and repository
+      block:
+        - name: Check if Mozilla keyring exists
+          ansible.builtin.stat:
+            path: /usr/share/keyrings/packages.mozilla.org.gpg
+          register: mozilla_keyring
+
+        - name: Add Mozilla APT key and repository
+          ansible.builtin.shell: |
+            wget -qO - https://packages.mozilla.org/apt/repo-signing-key.gpg | gpg --yes --dearmor -o /usr/share/keyrings/packages.mozilla.org.gpg
+            echo "deb [signed-by=/usr/share/keyrings/packages.mozilla.org.gpg] https://packages.mozilla.org/apt mozilla main" > /etc/apt/sources.list.d/mozilla.list
+            apt update -y
+          args:
+            executable: /bin/bash
+          when: not mozilla_keyring.stat.exists
+
+    - name: Install Firefox ESR
+      ansible.builtin.apt:
+        name: firefox-esr
+        state: present
+
+    - name: Install latest geckodriver
+      block:
+        - name: Check if geckodriver exists
+          ansible.builtin.stat:
+            path: /usr/local/bin/geckodriver
+          register: geckodriver_exists
+
+        - name: Install geckodriver
+          ansible.builtin.shell: |
+            GECKO_VERSION=$(curl -s https://api.github.com/repos/mozilla/geckodriver/releases/latest | grep tag_name | cut -d '"' -f 4)
+            wget -q https://github.com/mozilla/geckodriver/releases/download/$GECKO_VERSION/geckodriver-$GECKO_VERSION-linux64.tar.gz
+            tar -xzf geckodriver-$GECKO_VERSION-linux64.tar.gz
+            chmod +x geckodriver
+            mv geckodriver /usr/local/bin/
+            rm -f geckodriver-$GECKO_VERSION-linux64.tar.gz
+          args:
+            executable: /bin/bash
+          when: not geckodriver_exists.stat.exists
+
+    - name: Create system user for Recording Server
+      ansible.builtin.user:
+        name: nextcloud-recording
+        system: yes
+        create_home: no
+        home: /opt/nextcloud-recording
+        shell: /usr/sbin/nologin
+
+    - name: Check if nextcloud-recording service exists
+      ansible.builtin.stat:
+        path: /etc/systemd/system/nextcloud-recording.service
+      register: service_file
+
+    - name: Stop nextcloud-recording service if running
+      ansible.builtin.systemd:
+        name: nextcloud-recording
+        state: stopped
+      when: service_file.stat.exists
+
+    - name: Force remove existing nextcloud-recording directory
+      ansible.builtin.file:
+        path: /opt/nextcloud-recording
+        state: absent
+
+    - name: Create nextcloud-recording parent directory
+      ansible.builtin.file:
+        path: /opt
+        state: directory
+        mode: '0755'
+
+    - name: Clone Nextcloud Talk Recording Server (as root first)
+      ansible.builtin.git:
+        repo: https://github.com/nextcloud/nextcloud-talk-recording.git
+        dest: /opt/nextcloud-recording
+        version: main
+        force: yes
+
+    - name: Set ownership of recording directory to nextcloud-recording user
+      ansible.builtin.file:
+        path: /opt/nextcloud-recording
+        owner: nextcloud-recording
+        group: nextcloud-recording
+        recurse: yes
+        state: directory
+
+    - name: Create temporary directory for nextcloud-recording user
+      ansible.builtin.file:
+        path: /opt/nextcloud-recording/.ansible
+        state: directory
+        owner: nextcloud-recording
+        group: nextcloud-recording
+        mode: '0755'
+
+    - name: Create Python virtual environment
+      ansible.builtin.command:
+        cmd: python3 -m venv venv
+        chdir: /opt/nextcloud-recording
+        creates: /opt/nextcloud-recording/venv
+      become_user: nextcloud-recording
+      environment:
+        ANSIBLE_REMOTE_TMP: /opt/nextcloud-recording/.ansible/tmp
+
+    - name: Install Python dependencies
+      ansible.builtin.shell: |
+        source venv/bin/activate
+        pip install --upgrade pip
+        pip install .
+      args:
+        chdir: /opt/nextcloud-recording
+        executable: /bin/bash
+      become_user: nextcloud-recording
+      environment:
+        ANSIBLE_REMOTE_TMP: /opt/nextcloud-recording/.ansible/tmp
+
+    - name: Create data directory
+      ansible.builtin.file:
+        path: /var/lib/nextcloud-recording
+        state: directory
+        owner: nextcloud-recording
+        group: nextcloud-recording
+        mode: '0755'
+
+    - name: Create config directory
+      ansible.builtin.file:
+        path: /etc/nextcloud-talk-recording
+        state: directory
+        mode: '0755'
+
+    - name: Write server.conf
+      ansible.builtin.copy:
+        dest: /etc/nextcloud-talk-recording/server.conf
+        mode: '0644'
+        content: |
+          [logs]
+
+          [http]
+          listen = 127.0.0.1:4000
+
+          [app]
+          trustedproxies = 127.0.0.1
+
+          [backend]
+          backends = backend-id
+          directory = /var/lib/nextcloud-recording
+
+          [backend-id]
+          url = https://{{ cloud_url }}
+          secret = {{ talk_secret }}
+
+          [signaling]
+          signalings = signaling-id
+
+          [signaling-id]
+          url = https://{{ record_url }}/standalone-signaling
+          internalsecret = {{ talk_internal_secret }}
+
+          [ffmpeg]
+
+          [recording]
+
+          [stats]
+
+    - name: Create systemd service for Recording Server
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/nextcloud-recording.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Nextcloud Talk Recording Server
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=nextcloud-recording
+          WorkingDirectory=/opt/nextcloud-recording
+          ExecStart=/opt/nextcloud-recording/venv/bin/python -m nextcloud.talk.recording --config /etc/nextcloud-talk-recording/server.conf
+          Restart=always
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+    - name: Create Nginx site for Recording Server
+      ansible.builtin.copy:
+        dest: /etc/nginx/sites-available/{{ record_url }}
+        mode: '0644'
+        content: |
+          server {
+              listen 80;
+              server_name {{ record_url }};
+
+              location / {
+                  proxy_pass http://127.0.0.1:4000;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_cache_bypass $http_upgrade;
+                  proxy_read_timeout 86400;
+                  proxy_send_timeout 86400;
+              }
+          }
+
+    - name: Remove default nginx site if exists
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Enable Nginx site
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/{{ record_url }}
+        dest: /etc/nginx/sites-enabled/{{ record_url }}
+        state: link
+        force: true
+
+    - name: Test Nginx configuration
+      ansible.builtin.command: nginx -t
+      register: nginx_test
+      failed_when: nginx_test.rc != 0
+
+    - name: Reload Nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+
+    - name: Enable and start Recording Server
+      ansible.builtin.systemd:
+        name: nextcloud-recording
+        enabled: yes
+        state: started
+
+    - name: Wait for Recording Server to be ready
+      ansible.builtin.wait_for:
+        port: 4000
+        host: 127.0.0.1
+        delay: 5
+        timeout: 60
+
+    - name: Request SSL certificate for Recording Server
+      ansible.builtin.command: >
+        certbot --nginx
+        -d {{ record_url }}
+        --non-interactive --agree-tos
+        -m {{ admin_email }}
+        --redirect
+      register: certbot_run
+      changed_when: "'Successfully' in certbot_run.stdout or 'Certificate not yet due for renewal' in certbot_run.stdout"
+      failed_when:
+        - certbot_run.rc != 0
+        - "'Certificate not yet due for renewal' not in certbot_run.stdout"
+
+    - name: Restart services after SSL setup
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: restarted
+      loop:
+        - nginx
+        - nextcloud-recording
+
+    - name: Cleanup temporary files
+      ansible.builtin.file:
+        path: /opt/nextcloud-recording/.ansible
+        state: absent
+
+    - name: Display installation summary
+      ansible.builtin.debug:
+        msg: |
+          =========================================================
+          INSTALLATION COMPLETED SUCCESSFULLY!
+          =========================================================
+          Recording Server URL: https://{{ record_url }}
+          Cloud URL: {{ cloud_url }}
+          Data Directory: /var/lib/nextcloud-recording
+          Config File: /etc/nextcloud-talk-recording/server.conf
+          Service: nextcloud-recording
+          =========================================================
+          You can check the service status with:
+          systemctl status nextcloud-recording
+
+          View logs with:
+          journalctl -u nextcloud-recording -f
+          =========================================================
